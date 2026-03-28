@@ -1,5 +1,5 @@
 # u6e-scanner
-real-time client scanner for Ubiquiti U6 Enterprise
+real-time client scanner for Ubiquiti U6 Enterprise\
 verified working on firmware 6.8.2.15592 (March 2026)
 
 ![screenshot](docs/images/screenshot.png)
