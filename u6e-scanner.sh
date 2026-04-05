@@ -15,7 +15,9 @@ set -eu
 #   wlanconfig list sta       → negotiated TxRate (AP→client) and RxRate (client→AP) in Mbps;
 #                               one batch call per iface. "iw" does NOT report bitrate on this
 #                               firmware; wlanconfig is the only reliable source.
-#   iwconfig                  → noise floor per iface (for SNR); cached NOISE_CACHE_SEC seconds
+#
+# Every NOISE_CACHE_SEC (noise background loop):
+#   iwconfig                  → noise floor per iface (for SNR); averaged per band into noise.tsv
 #
 # Every IW_CACHE_SEC (fast background loop):
 #   iw station get <mac>      → tx_retries, tx_failed; one call per client, run in background
@@ -41,9 +43,11 @@ set -eu
 #   3. build_ssid_map         — populate ssid.tsv immediately so first frame shows SSIDs
 #   4. start_hostmap_updater  — launch slow background loop (HOST_CACHE_SEC)
 #   5. start_iw_updater       — launch fast background loop (IW_CACHE_SEC)
+#   6. start_noise_updater    — launch noise floor background loop (NOISE_CACHE_SEC)
 #
 # Main loop (every REFRESH_MS; PRIME_MS on the first cycle):
-#   Phase 1 (parallel): for all active AP ifaces simultaneously:
+#   Phase 1 (parallel): for all active AP ifaces simultaneously, and within each iface
+#     wlanconfig and hostapd_cli also run in parallel with each other:
 #     - wlanconfig list sta → <iface>_rates.tsv (TxRate/RxRate per MAC) [atomic write]
 #     - hostapd_cli all_sta → <iface>_hostapd.tsv (signal, tx_packets per MAC) [atomic write]
 #   Phase 2 (serial merge): for each iface:
@@ -122,11 +126,11 @@ set -eu
 
 # ─── ENV VARS ────────────────────────────────────────────────────────────────
 #
-#   REFRESH_MS=2000        main loop cadence in ms (first cycle uses PRIME_MS)
+#   REFRESH_MS=1000        main loop cadence in ms (first cycle uses PRIME_MS)
 #   PRIME_MS=500           sleep after first snapshot before showing initial table
 #   IW_CACHE_SEC=2         iw background loop period (retries/failed refresh)
 #   HOST_CACHE_SEC=60      slow background loop period (hostname/DNS/SSID/iface refresh)
-#   NOISE_CACHE_SEC=10     noise floor cache lifetime in seconds
+#   NOISE_CACHE_SEC=10     noise floor background loop period in seconds
 #   RETRY_WINDOW_SEC=30    rolling window length for txr%
 #   WIN_FORMULA=r2         retry% denominator: r1=tx, r2=tx+failed, r3=tx+failed+retries
 #   WIN_PARTIAL=0          0=blank txr% until full window elapsed; 1=show partial immediately
@@ -166,7 +170,7 @@ DNS_MAP_FILE="$BASE_DIR/dnsnames.tsv"
 IP_MAP_FILE="$BASE_DIR/ipmap.tsv"
 BAND_CACHE_FILE="$BASE_DIR/band_cache.tsv"
 NOISE_LAST_UPDATE_FILE="$BASE_DIR/noise.lastupdate"
-REFRESH_MS="${REFRESH_MS:-2000}"
+REFRESH_MS="${REFRESH_MS:-1000}"
 PRIME_MS="${PRIME_MS:-500}"
 NOISE_CACHE_SEC="${NOISE_CACHE_SEC:-10}"
 HIDE_IDLE="${HIDE_IDLE:-0}"
@@ -199,6 +203,7 @@ WIN_FORMULA="${WIN_FORMULA:-r2}"
 DNSNAME_ENABLE="${DNSNAME_ENABLE:-1}"
 DEBUG_INTERVAL="${DEBUG_INTERVAL:-0}"
 IW_PID_FILE="$BASE_DIR/iw_updater.pid"
+NOISE_PID_FILE="$BASE_DIR/noise_updater.pid"
 bootstrap_from_arp() {
     # Quick hostname bootstrap: ARP table gives MAC→IP instantly; nslookup gives
     # IP→hostname (~50ms each). Writes each hostname to hostnames.tsv immediately
@@ -227,7 +232,7 @@ bootstrap_from_arp() {
 # Reset volatile state at cold start so no prior run contaminates deltas/window
 reset_volatile_state() {
     # Kill stale background processes from any prior run before clearing their PID files
-    for pidfile in "$PID_FILE" "$IW_PID_FILE"; do
+    for pidfile in "$PID_FILE" "$IW_PID_FILE" "$NOISE_PID_FILE"; do
         if [ -f "$pidfile" ]; then
             old_pid=$(cat "$pidfile" 2>/dev/null || true)
             [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null || true
@@ -637,6 +642,7 @@ cleanup() {
     log_ts "cleanup start"
     stop_hostmap_updater
     stop_iw_updater
+    stop_noise_updater
     # Remove temporary/volatile files
     rm -f "$BASE_DIR"/*_hostapd.tsv "$BASE_DIR"/*_iw.tsv 2>/dev/null || true
     rm -rf "$WINDOW_DIR" 2>/dev/null || true
@@ -807,13 +813,33 @@ stop_iw_updater() {
     fi
 }
 
+start_noise_updater() {
+    # Background loop: refresh per-band noise floor every NOISE_CACHE_SEC.
+    # Runs independently so iwconfig calls never block the main refresh loop.
+    log_ts "noise updater: starting"
+    (
+        while :; do
+            compute_noise_map >/dev/null 2>&1 || true
+            sleep "${NOISE_CACHE_SEC:-10}" || exit 0
+        done
+    ) >/dev/null 2>&1 &
+    echo $! > "$NOISE_PID_FILE" 2>/dev/null || true
+    log_ts "noise updater: started pid=$(cat "$NOISE_PID_FILE" 2>/dev/null)"
+}
+
+stop_noise_updater() {
+    if [ -f "$NOISE_PID_FILE" ]; then
+        pid=$(cat "$NOISE_PID_FILE" 2>/dev/null || echo 0)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
+        rm -f "$NOISE_PID_FILE" 2>/dev/null || true
+    fi
+}
+
 collect_snapshot() {
     # Produce TSV rows atomically to avoid races: band    ssid    mac    host    signal    tx_packets    tx_retries    tx_failed    timestamp
     TEMP_RAW="$BASE_DIR/cur_raw.$$.tsv"
     : > "$TEMP_RAW"
     ts=$(date +%s)
-    # Update per-band noise map from iwconfig for SNR calculations (cached for NOISE_CACHE_SEC seconds)
-    compute_noise_map_cached >/dev/null 2>&1 || true
     # Use hostname map from background updater (empty initially, populates within 60s)
     MFILE="$MAP_FILE"
     [ -e "$MFILE" ] || : > "$MFILE"
@@ -843,7 +869,9 @@ collect_snapshot() {
                 }
             ' > "$rtmp" 2>/dev/null || true
             mv -f "$rtmp" "$rfile" 2>/dev/null || true
-
+        ) &
+        _rp=$!
+        (
             $HOSTAPD_CLI_BIN -i "$ifc" all_sta 2>/dev/null | awk 'BEGIN{sig="";txp="";mac=""}
                 /^[0-9a-fA-F][0-9a-fA-F]:/ { if(mac!=""){printf "%s\t%s\t%s\n", tolower(mac), sig, txp} ; mac=$0; sig=""; txp=""; next }
                 /^signal=/{split($0,a,"="); sig=a[2]; next}
@@ -853,7 +881,7 @@ collect_snapshot() {
             ' > "$htmp" 2>/dev/null || true
             mv -f "$htmp" "$hfile" 2>/dev/null || true
         ) &
-        _collect_pids="$_collect_pids $!"
+        _collect_pids="$_collect_pids $_rp $!"
     done
     # Wait only for the collection jobs spawned above (not the long-running background loops)
     for _pid in $_collect_pids; do
@@ -1098,6 +1126,7 @@ bootstrap_from_arp >/dev/null 2>&1 &  # background: ARP+nslookup hostnames, one 
 build_ssid_map                         # fast SSID population before first frame
 start_hostmap_updater                  # background: hostname/DNS/SSID/ifaces every HOST_CACHE_SEC
 start_iw_updater                       # background: iw retries/failed every IW_CACHE_SEC
+start_noise_updater                    # background: noise floor every NOISE_CACHE_SEC
 while :; do
     start_ms=$(now_ms)
     log_ts "collect start"
