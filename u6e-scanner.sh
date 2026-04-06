@@ -4,7 +4,7 @@ set -eu
 # u6e-scanner — real-time per-client WiFi monitor for Ubiquiti U6 Enterprise
 #
 # Displays one row per connected client, updated every REFRESH_MS, showing:
-#   band, ssid, dnsname, hostname, ip, [mac], d_tx, d_r, d_txr%, txr%-N, sig, snr, TxRate, RxRate
+#   band, ssid, dnsname, hostname, ip, [mac], d_tx, d_r, txr%-5, txr%-N, sig, snr, TxRate, RxRate
 #
 # Verified on firmware 6.8.2 (LEDE 17.01, BusyBox ash, Qualcomm IPQ50xx armv7l).
 
@@ -107,7 +107,7 @@ set -eu
 #   [mac]     MAC address (shown only with -m flag)
 #   d_tx      tx_packets delta since last refresh (packet count, not bytes)
 #   d_r       tx_retries delta since last refresh
-#   d_txr%    per-interval retry ratio: d_r / (d_tx + d_failed) × 100
+#   txr%-5    rolling retry% over last 5 seconds (blank until enough data)
 #   txr%-N    rolling retry% over N seconds (RETRY_WINDOW_SEC; blank until full window)
 #   sig       RSSI in dBm
 #   snr       signal - per-band noise floor in dB (blank if noise unknown or > -40 dBm)
@@ -1006,10 +1006,10 @@ print_report() {
     # - Formats output and sorts by SNR desc (fallback to signal)
     if [ "$SHOW_MAC" = "1" ]; then
         printf '\033[1m%-7s %-12s %-22s %-20s %-15s %17s %5s %6s %8s   %7s %9s %6s  %9s %9s\033[0m\033[K\n' \
-            "band" "ssid" "dnsname" "hostname" "ip" "mac" "d_tx" "d_r" "d_txr%" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
+            "band" "ssid" "dnsname" "hostname" "ip" "mac" "d_tx" "d_r" "txr%-5" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
     else
         printf '\033[1m%-7s %-12s %-22s %-20s %-15s %5s %6s %8s   %7s %9s %6s  %9s %9s\033[0m\033[K\n' \
-            "band" "ssid" "dnsname" "hostname" "ip" "d_tx" "d_r" "d_txr%" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
+            "band" "ssid" "dnsname" "hostname" "ip" "d_tx" "d_r" "txr%-5" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
     fi
     date_hms=$(date +%H:%M:%S)
     awk -v now_hms="$date_hms" -v hide="$HIDE_IDLE" -v wdir="$WINDOW_DIR" -v prevfn="$STATE_PREV" -v win_secs="$RETRY_WINDOW_SEC" -v dbg="${DEBUG_WIN:-0}" -v dbgfile="$BASE_DIR/win_dbg.txt" -v hilites="$HILITE_HOSTS" -v hilitedns="$HILITE_DNS" -v hilitename="$HILITE_NAME" -v onlyname="$ONLY_NAME" -v win_partial="$WIN_PARTIAL" -v win_formula="$WIN_FORMULA" -v win_min_pkts="$WIN_MIN_PKTS" -v noisefn="$NOISE_FILE" -v dnsfn="$DNS_MAP_FILE" -v ipfn="$IP_MAP_FILE" -v idebug="${DEBUG_INTERVAL:-0}" -v idbgfile="$BASE_DIR/interval_dbg.txt" -v show_mac="$SHOW_MAC" 'BEGIN{FS="\t"; OFS="\t";
@@ -1037,31 +1037,32 @@ print_report() {
             iw_ok=($7+0 >= 0 && p[7]+0 >= 0)
             if (iw_ok) { dr=$7-p[7]; df=$8-p[8]; if(dr<0||df<0) next }
             else { dr=0; df=0 }
-            a1=dtx; a2=dtx+df
-            r1=(a1>0)?(dr*100.0/a1):0
-            r2=(a2>0)?(dr*100.0/a2):0
             if ((idebug+0)>0) {
-                # Log per-interval packet deltas and computed ratio
-                printf("%s\tmac=%s\td_tx=%d\td_r=%d\td_f=%d\tr/(tx+f)=%.4f%%\n", now_hms, key, dtx, dr, df, r2) >> idbgfile
+                printf("%s\tmac=%s\td_tx=%d\td_r=%d\td_f=%d\n", now_hms, key, dtx, dr, df) >> idbgfile
             }
-            # Per-MAC rolling window: sum per-cycle deltas within the trailing window.
-            # History records contain deltas (not cumulative values) so no baseline
-            # arithmetic is needed — just sum what is inside the window.
-            hist=wdir "/" key ".hist"; winp_val=0; denom=0; wtx=0; wr=0; wf=0;
-            snap_ts=$9+0; cutoff=snap_ts-win_secs; min_ts=-1
+            # Per-MAC rolling windows: read hist once, accumulate into 5s and 30s buckets.
+            # Records contain per-cycle deltas; window value = sum / denom over the period.
+            hist=wdir "/" key ".hist"
+            wtx=0; wr=0; wf=0; wtx5=0; wr5=0; wf5=0
+            snap_ts=$9+0; cutoff=snap_ts-win_secs; cutoff5=snap_ts-5; min_ts=-1
             while ( (getline line < hist) > 0 ) {
-                split(line, hh, " ")
-                ts=hh[1]+0
+                split(line, hh, " "); ts=hh[1]+0
                 if (min_ts<0) min_ts=ts
-                if (ts <= cutoff) continue  # outside window; skip but keep reading for min_ts
-                wtx += hh[2]+0; wr += hh[3]+0; wf += hh[4]+0
+                if (ts > cutoff)  { wtx +=hh[2]+0; wr +=hh[3]+0; wf +=hh[4]+0 }
+                if (ts > cutoff5) { wtx5+=hh[2]+0; wr5+=hh[3]+0; wf5+=hh[4]+0 }
             }
             close(hist)
-            if (win_formula=="r1") { denom=wtx }
-            else if (win_formula=="r3") { denom=wtx+wf+wr }
-            else { denom=wtx+wf }
+            # 5s window (txr%-5)
+            if (win_formula=="r1") { denom5=wtx5 } else if (win_formula=="r3") { denom5=wtx5+wf5+wr5 } else { denom5=wtx5+wf5 }
+            d5_str=""
+            if (iw_ok && denom5>0 && wtx5>=win_min_pkts+0) {
+                d5_val=wr5*100.0/denom5; if (d5_val>100) d5_val=100
+                d5_str=sprintf("%.1f%%", d5_val)
+            }
+            # 30s window (txr%-30)
+            if (win_formula=="r1") { denom=wtx } else if (win_formula=="r3") { denom=wtx+wf+wr } else { denom=wtx+wf }
+            winp_val=0
             if (denom>0) { winp_val=wr*100.0/denom; if (winp_val>100) winp_val=100 }
-            # Gate display: iw must be available, window must be full, minimum traffic required
             age = (min_ts>0) ? (snap_ts - min_ts) : 0
             if (!iw_ok) {
                 win_str = ""
@@ -1072,7 +1073,7 @@ print_report() {
                 win_str = (ready ? sprintf("%.1f%%", winp_val) : "")
             }
             if (dbg+0>0) {
-                printf("%s\t%s\tsnap=%d min_ts=%d age=%d wtx=%d wr=%d wf=%d denom=%d win=%.2f ready=%d\n", now_hms, key, snap_ts, min_ts, age, wtx, wr, wf, denom, winp_val, ready) >> dbgfile
+                printf("%s\t%s\tsnap=%d min_ts=%d age=%d wtx5=%d wr5=%d d5=%s wtx=%d wr=%d denom=%d win=%.2f ready=%d\n", now_hms, key, snap_ts, min_ts, age, wtx5, wr5, d5_str, wtx, wr, denom, winp_val, ready) >> dbgfile
             }
             snr_str=""; if (($1 in noise) && noise[$1] <= -40) { snr_val=$5 - noise[$1]; snr_str = sprintf("%d", snr_val) }
             # Read negotiated Tx/Rx rates from cur.tsv fields 11 (rxrate) and 12 (txrate)
@@ -1102,11 +1103,11 @@ print_report() {
             }
             if (matched) { pre="\033[1m"; post="\033[0m" } else { pre=""; post="" }
             if (show_mac+0 == 1) {
-                line = sprintf("%s%-7s %-12s %-22s %-20s %-15s %-17s %5d %6d %7.1f%%   %7s %9s %6s  %9s %9s%s",
-                                pre, $1, $2, dns_out, ($4==""?"-":$4), ip_out, $3, dtx, dr, r2, win_str, sig_out, snr_out, txrate_str, rxrate_str, post)
+                line = sprintf("%s%-7s %-12s %-22s %-20s %-15s %-17s %5d %6d %8s   %7s %9s %6s  %9s %9s%s",
+                                pre, $1, $2, dns_out, ($4==""?"-":$4), ip_out, $3, dtx, dr, d5_str, win_str, sig_out, snr_out, txrate_str, rxrate_str, post)
             } else {
-                line = sprintf("%s%-7s %-12s %-22s %-20s %-15s %5d %6d %7.1f%%   %7s %9s %6s  %9s %9s%s",
-                                pre, $1, $2, dns_out, ($4==""?"-":$4), ip_out, dtx, dr, r2, win_str, sig_out, snr_out, txrate_str, rxrate_str, post)
+                line = sprintf("%s%-7s %-12s %-22s %-20s %-15s %5d %6d %8s   %7s %9s %6s  %9s %9s%s",
+                                pre, $1, $2, dns_out, ($4==""?"-":$4), ip_out, dtx, dr, d5_str, win_str, sig_out, snr_out, txrate_str, rxrate_str, post)
             }
             printf "%05d|%s\033[K\n", keynum, line
         }' "$STATE_PREV" "$STATE_CUR" |
