@@ -107,8 +107,8 @@ set -eu
 #   [mac]     MAC address (shown only with -m flag)
 #   d_tx      tx_packets delta since last refresh (packet count, not bytes)
 #   d_r       tx_retries delta since last refresh
-#   txr%-5    rolling retry% over last 5 seconds (blank until enough data)
-#   txr%-N    rolling retry% over N seconds (RETRY_WINDOW_SEC; blank until full window)
+#   txr%-5    rolling retry% over last 5 seconds; "-"=idle, "0.0%"=too few pkts, blank=no iw data yet
+#   txr%-N    rolling retry% over N seconds (RETRY_WINDOW_SEC); "-"=idle, "0.0%"=too few pkts, blank=window not full or no iw data
 #   sig       RSSI in dBm
 #   snr       signal - per-band noise floor in dB (blank if noise unknown or > -40 dBm)
 #   TxRate    negotiated downlink rate AP→client in Mbps (from wlanconfig)
@@ -1053,24 +1053,30 @@ print_report() {
             }
             close(hist)
             # 5s window (txr%-5)
+            # blank=no iw data yet; "-"=idle (no pkts); "0.0%"=too few pkts; else real value
             if (win_formula=="r1") { denom5=wtx5 } else if (win_formula=="r3") { denom5=wtx5+wf5+wr5 } else { denom5=wtx5+wf5 }
-            d5_str=""
-            if (iw_ok && denom5>0 && wtx5>=win_min_pkts+0) {
-                d5_val=wr5*100.0/denom5; if (d5_val>100) d5_val=100
-                d5_str=sprintf("%.1f%%", d5_val)
-            }
+            if (!iw_ok)                    { d5_str="" }
+            else if (wtx5==0)              { d5_str="-" }
+            else if (wtx5<win_min_pkts+0)  { d5_str="0.0%" }
+            else { d5_val=wr5*100.0/denom5; if (d5_val>100) d5_val=100; d5_str=sprintf("%.1f%%", d5_val) }
             # 30s window (txr%-30)
+            # blank=no iw data or window not yet full; "-"=idle; "0.0%"=too few pkts; else real value
             if (win_formula=="r1") { denom=wtx } else if (win_formula=="r3") { denom=wtx+wf+wr } else { denom=wtx+wf }
             winp_val=0
             if (denom>0) { winp_val=wr*100.0/denom; if (winp_val>100) winp_val=100 }
             age = (min_ts>0) ? (snap_ts - min_ts) : 0
             if (!iw_ok) {
                 win_str = ""
+            } else if (wtx==0) {
+                win_str = "-"
             } else if ((win_partial+0)==1) {
-                win_str = (denom>0 ? sprintf("%.1f%%", winp_val) : "")
+                win_str = (wtx>=win_min_pkts+0 && denom>0) ? sprintf("%.1f%%", winp_val) : "0.0%"
             } else {
-                ready = (age>=win_secs && denom>0 && wtx>=win_min_pkts+0) ? 1 : 0
-                win_str = (ready ? sprintf("%.1f%%", winp_val) : "")
+                if (age>=win_secs && denom>0) {
+                    win_str = (wtx>=win_min_pkts+0) ? sprintf("%.1f%%", winp_val) : "0.0%"
+                } else {
+                    win_str = ""
+                }
             }
             if (dbg+0>0) {
                 printf("%s\t%s\tsnap=%d min_ts=%d age=%d wtx5=%d wr5=%d d5=%s wtx=%d wr=%d denom=%d win=%.2f ready=%d\n", now_hms, key, snap_ts, min_ts, age, wtx5, wr5, d5_str, wtx, wr, denom, winp_val, ready) >> dbgfile
