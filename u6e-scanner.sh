@@ -129,12 +129,13 @@ set -eu
 #
 #   REFRESH_MS=1000        main loop cadence in ms (first cycle uses PRIME_MS)
 #   PRIME_MS=500           sleep after first snapshot before showing initial table
-#   IW_CACHE_SEC=4         iw background loop period (retries/failed refresh)
+#   IW_CACHE_SEC=2         iw background loop period (retries/failed refresh)
 #   HOST_CACHE_SEC=60      slow background loop period (hostname/DNS/SSID/iface refresh)
 #   NOISE_CACHE_SEC=10     noise floor background loop period in seconds
 #   RETRY_WINDOW_SEC=30    rolling window length for txr%
 #   WIN_FORMULA=r2         retry% denominator: r1=tx, r2=tx+failed, r3=tx+failed+retries
 #   WIN_PARTIAL=0          0=blank txr% until full window elapsed; 1=show partial immediately
+#   WIN_MIN_PKTS=10        minimum tx_packets in window required to display txr%-N
 #   IFACES=auto            "auto" discovers active AP ifaces; or space-separated list
 #   USE_IW=1               1=use iw background loop for retries/failed; 0=skip
 #   IW_GET_ONLY=1          1=per-station iw get only (skip iw dump, unreliable on this fw)
@@ -198,8 +199,9 @@ NSLOOKUP_BIN="${NSLOOKUP_BIN_RAW}"
 DBG_LOG="$BASE_DIR/debug.log"
 USE_IW="${USE_IW:-1}"
 IW_GET_ONLY="${IW_GET_ONLY:-1}"
-IW_CACHE_SEC="${IW_CACHE_SEC:-4}"
+IW_CACHE_SEC="${IW_CACHE_SEC:-2}"
 WIN_PARTIAL="${WIN_PARTIAL:-0}"
+WIN_MIN_PKTS="${WIN_MIN_PKTS:-10}"
 WIN_FORMULA="${WIN_FORMULA:-r2}"
 DNSNAME_ENABLE="${DNSNAME_ENABLE:-1}"
 DEBUG_INTERVAL="${DEBUG_INTERVAL:-0}"
@@ -971,16 +973,25 @@ collect_snapshot() {
     # Publish snapshot atomically; discard raw
     mv -f "$TEMP_CUR" "$STATE_CUR" 2>/dev/null || true
     rm -f "$TEMP_RAW" 2>/dev/null || true
-    # Update per-MAC history for rolling window
+    # Update per-MAC history for rolling window.
+    # Store per-cycle DELTAS (not cumulative values) so the window sum is a simple
+    # sum over records in the window — no baseline-crossing artifact from iw caching.
     mkdir -p "$WINDOW_DIR" 2>/dev/null || true
     awk -v wdir="$WINDOW_DIR" 'BEGIN{FS="\t"}
-        {
-          if ($7+0 < 0 || $8+0 < 0) next  # skip rows where iw data is absent (sentinel -1)
-          mac=$3; ts=$9; txp=$6; txr=$7; txf=$8;
-          fn=wdir "/" mac ".hist";
-          printf "%s %s %s %s\n", ts, txp, txr, txf >> fn
+        FNR==NR{
+            if ($7+0 < 0 || $8+0 < 0) next  # prev had iw sentinel; mark invalid
+            ppkt[$3]=$6+0; prtr[$3]=$7+0; pfail[$3]=$8+0; next
         }
-    ' "$STATE_CUR" 2>/dev/null || true
+        {
+            if ($7+0 < 0 || $8+0 < 0) next  # cur has iw sentinel; skip
+            mac=$3
+            if (!(mac in ppkt)) next  # no valid prev record for this MAC
+            dpkt  = $6 - ppkt[mac]; if (dpkt  < 0) dpkt  = 0
+            drtr  = $7 - prtr[mac]; if (drtr  < 0) drtr  = 0
+            dfail = $8 - pfail[mac]; if (dfail < 0) dfail = 0
+            printf "%s %s %s %s\n", $9, dpkt, drtr, dfail >> wdir "/" mac ".hist"
+        }
+    ' "$STATE_PREV" "$STATE_CUR" 2>/dev/null || true
     # History pruning is handled by the slow background loop (start_hostmap_updater)
     # to avoid spawning N awk processes per refresh cycle.
 }
@@ -1001,7 +1012,7 @@ print_report() {
             "band" "ssid" "dnsname" "hostname" "ip" "d_tx" "d_r" "d_txr%" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
     fi
     date_hms=$(date +%H:%M:%S)
-    awk -v now_hms="$date_hms" -v hide="$HIDE_IDLE" -v wdir="$WINDOW_DIR" -v prevfn="$STATE_PREV" -v win_secs="$RETRY_WINDOW_SEC" -v dbg="${DEBUG_WIN:-0}" -v dbgfile="$BASE_DIR/win_dbg.txt" -v hilites="$HILITE_HOSTS" -v hilitedns="$HILITE_DNS" -v hilitename="$HILITE_NAME" -v onlyname="$ONLY_NAME" -v win_partial="$WIN_PARTIAL" -v win_formula="$WIN_FORMULA" -v noisefn="$NOISE_FILE" -v dnsfn="$DNS_MAP_FILE" -v ipfn="$IP_MAP_FILE" -v idebug="${DEBUG_INTERVAL:-0}" -v idbgfile="$BASE_DIR/interval_dbg.txt" -v show_mac="$SHOW_MAC" 'BEGIN{FS="\t"; OFS="\t";
+    awk -v now_hms="$date_hms" -v hide="$HIDE_IDLE" -v wdir="$WINDOW_DIR" -v prevfn="$STATE_PREV" -v win_secs="$RETRY_WINDOW_SEC" -v dbg="${DEBUG_WIN:-0}" -v dbgfile="$BASE_DIR/win_dbg.txt" -v hilites="$HILITE_HOSTS" -v hilitedns="$HILITE_DNS" -v hilitename="$HILITE_NAME" -v onlyname="$ONLY_NAME" -v win_partial="$WIN_PARTIAL" -v win_formula="$WIN_FORMULA" -v win_min_pkts="$WIN_MIN_PKTS" -v noisefn="$NOISE_FILE" -v dnsfn="$DNS_MAP_FILE" -v ipfn="$IP_MAP_FILE" -v idebug="${DEBUG_INTERVAL:-0}" -v idbgfile="$BASE_DIR/interval_dbg.txt" -v show_mac="$SHOW_MAC" 'BEGIN{FS="\t"; OFS="\t";
             # Load auxiliary maps: noise per band, DNS names, IP addresses
             if (noisefn!="") { while ( (getline nl < noisefn) > 0 ) { split(nl, nn, FS); if (nn[1]!="") noise[nn[1]]=nn[2]+0 } close(noisefn) }
             if (dnsfn!="") { while ( (getline dl < dnsfn) > 0 ) { split(dl, dd, FS); if (dd[1]!="") dns[dd[1]]=dd[2] } close(dnsfn) }
@@ -1033,47 +1044,35 @@ print_report() {
                 # Log per-interval packet deltas and computed ratio
                 printf("%s\tmac=%s\td_tx=%d\td_r=%d\td_f=%d\tr/(tx+f)=%.4f%%\n", now_hms, key, dtx, dr, df, r2) >> idbgfile
             }
-            # Per-MAC rolling window: compute against baseline within trailing window
-            # Default to per-interval retry ratio as a safe fallback; override if history is available
-            hist=wdir "/" key ".hist"; winp_val=r2; denom=0; wtx=0; wr=0; wf=0;
-            # Use snapshot ts from prev row to align timebase
-            snap_ts=$9+0
-            cutoff=snap_ts-win_secs
-            bt=-1; btxp=0; btxr=0; btxf=0
-            ft=-1; ftxp=0; ftxr=0; ftxf=0
+            # Per-MAC rolling window: sum per-cycle deltas within the trailing window.
+            # History records contain deltas (not cumulative values) so no baseline
+            # arithmetic is needed — just sum what is inside the window.
+            hist=wdir "/" key ".hist"; winp_val=0; denom=0; wtx=0; wr=0; wf=0;
+            snap_ts=$9+0; cutoff=snap_ts-win_secs; min_ts=-1
             while ( (getline line < hist) > 0 ) {
                 split(line, hh, " ")
                 ts=hh[1]+0
-                if (ft<0) { ft=ts; ftxp=hh[2]+0; ftxr=hh[3]+0; ftxf=hh[4]+0 }
-                if (ts <= cutoff) { bt=ts; btxp=hh[2]+0; btxr=hh[3]+0; btxf=hh[4]+0; continue }
-                # first record after cutoff; stop scanning
-                break
+                if (min_ts<0) min_ts=ts
+                if (ts <= cutoff) continue  # outside window; skip but keep reading for min_ts
+                wtx += hh[2]+0; wr += hh[3]+0; wf += hh[4]+0
             }
             close(hist)
-            if (ft>0) {
-                # Choose baseline: prefer last <= cutoff else earliest kept
-                if (bt>0) { bpx=btxp; brx=btxr; bfx=btxf } else { bpx=ftxp; brx=ftxr; bfx=ftxf }
-                wtx=$6-bpx; if (wtx<0) wtx=0;
-                wr=$7-brx;  if (wr<0)  wr=0;
-                wf=$8-bfx;  if (wf<0)  wf=0;
-                # Window denominator selection
-                if (win_formula=="r1") { denom=wtx }
-                else if (win_formula=="r3") { denom=wtx+wf+wr }
-                else { denom=wtx+wf }
-                if (denom>0) { winp_val=wr*100.0/denom } else { winp_val=0 }
-            }
-            # Gate display: blank if iw unavailable, window not full, or no denominator
-            age = (ft>0)? (snap_ts - ft) : 0;
+            if (win_formula=="r1") { denom=wtx }
+            else if (win_formula=="r3") { denom=wtx+wf+wr }
+            else { denom=wtx+wf }
+            if (denom>0) { winp_val=wr*100.0/denom; if (winp_val>100) winp_val=100 }
+            # Gate display: iw must be available, window must be full, minimum traffic required
+            age = (min_ts>0) ? (snap_ts - min_ts) : 0
             if (!iw_ok) {
                 win_str = ""
             } else if ((win_partial+0)==1) {
-                win_str = sprintf("%.1f%%", winp_val);
+                win_str = (denom>0 ? sprintf("%.1f%%", winp_val) : "")
             } else {
-                ready = (age>=win_secs && denom>0) ? 1 : 0;
-                win_str = (ready ? sprintf("%.1f%%", winp_val) : "");
+                ready = (age>=win_secs && denom>0 && wtx>=win_min_pkts+0) ? 1 : 0
+                win_str = (ready ? sprintf("%.1f%%", winp_val) : "")
             }
             if (dbg+0>0) {
-                printf("%s\t%s\tft=%d bt=%d snap=%d wtx=%d wr=%d wf=%d denom=%d win=%.2f age=%d ready=%d\n", now_hms, key, ft, bt, snap_ts, wtx, wr, wf, denom, winp_val, age, ready) >> dbgfile
+                printf("%s\t%s\tsnap=%d min_ts=%d age=%d wtx=%d wr=%d wf=%d denom=%d win=%.2f ready=%d\n", now_hms, key, snap_ts, min_ts, age, wtx, wr, wf, denom, winp_val, ready) >> dbgfile
             }
             snr_str=""; if (($1 in noise) && noise[$1] <= -40) { snr_val=$5 - noise[$1]; snr_str = sprintf("%d", snr_val) }
             # Read negotiated Tx/Rx rates from cur.tsv fields 11 (rxrate) and 12 (txrate)
