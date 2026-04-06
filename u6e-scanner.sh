@@ -128,7 +128,7 @@ set -eu
 #
 #   REFRESH_MS=1000        main loop cadence in ms (first cycle uses PRIME_MS)
 #   PRIME_MS=500           sleep after first snapshot before showing initial table
-#   IW_CACHE_SEC=2         iw background loop period (retries/failed refresh)
+#   IW_CACHE_SEC=4         iw background loop period (retries/failed refresh)
 #   HOST_CACHE_SEC=60      slow background loop period (hostname/DNS/SSID/iface refresh)
 #   NOISE_CACHE_SEC=10     noise floor background loop period in seconds
 #   RETRY_WINDOW_SEC=30    rolling window length for txr%
@@ -197,13 +197,25 @@ NSLOOKUP_BIN="${NSLOOKUP_BIN_RAW}"
 DBG_LOG="$BASE_DIR/debug.log"
 USE_IW="${USE_IW:-1}"
 IW_GET_ONLY="${IW_GET_ONLY:-1}"
-IW_CACHE_SEC="${IW_CACHE_SEC:-2}"
+IW_CACHE_SEC="${IW_CACHE_SEC:-4}"
 WIN_PARTIAL="${WIN_PARTIAL:-0}"
 WIN_FORMULA="${WIN_FORMULA:-r2}"
 DNSNAME_ENABLE="${DNSNAME_ENABLE:-1}"
 DEBUG_INTERVAL="${DEBUG_INTERVAL:-0}"
 IW_PID_FILE="$BASE_DIR/iw_updater.pid"
 NOISE_PID_FILE="$BASE_DIR/noise_updater.pid"
+
+# Detect best sub-second sleep method once at startup to avoid fork-per-sleep
+if command -v usleep >/dev/null 2>&1; then
+    _SLEEP_METHOD="usleep"
+elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx usleep; then
+    _SLEEP_METHOD="busybox_usleep"
+elif sleep 0.001 2>/dev/null; then
+    _SLEEP_METHOD="fractional"
+else
+    _SLEEP_METHOD="whole"
+fi
+
 bootstrap_from_arp() {
     # Quick hostname bootstrap: ARP table gives MAC→IP instantly; nslookup gives
     # IP→hostname (~50ms each). Writes each hostname to hostnames.tsv immediately
@@ -319,29 +331,15 @@ log_ts() {
     printf "%s %s\n" "$(date +%H:%M:%S)" "$*" >> "$DBG_LOG" 2>/dev/null || true
 }
 
-# Sleep helper that accepts milliseconds
+# Sleep helper that accepts milliseconds; uses method detected at startup
 sleep_ms() {
-    ms="$1"
-    [ -z "$ms" ] && ms=1000
-    # Prefer usleep if available (including via busybox)
-    if command -v usleep >/dev/null 2>&1; then
-        usleep "$((ms * 1000))"
-        return 0
-    fi
-    if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx usleep; then
-        busybox usleep "$((ms * 1000))"
-        return 0
-    fi
-    secs=$(awk -v m="$ms" 'BEGIN{printf "%.3f", m/1000}')
-    # If fractional sleep works, use it
-    if sleep 0.001 2>/dev/null; then
-        sleep "$secs" 2>/dev/null || true
-        return 0
-    fi
-    # No fractional sleep available: only sleep if >=1s, else skip
-    if [ "$ms" -ge 1000 ]; then
-        sleep $(( (ms + 999) / 1000 ))
-    fi
+    ms="${1:-1000}"
+    case "$_SLEEP_METHOD" in
+        usleep)         usleep "$((ms * 1000))" ;;
+        busybox_usleep) busybox usleep "$((ms * 1000))" ;;
+        fractional)     sleep "$(awk -v m="$ms" 'BEGIN{printf "%.3f", m/1000}')" 2>/dev/null || true ;;
+        whole)          [ "$ms" -ge 1000 ] && sleep $(( (ms + 999) / 1000 )) || true ;;
+    esac
 }
 
 now_ms() {
@@ -753,15 +751,12 @@ get_band_from_iface() {
 process_station_iw() {
     # $1=iface $2=mac $3=output_file — appends "mac tr tf" line
     local ifc="$1" mac="$2" outfile="$3"
-    stats=$($IW_BIN dev "$ifc" station get "$mac" 2>/dev/null | awk '
-        BEGIN{tr="";tf=""}
-        /tx retries/{split($0,a,":"); gsub(/[^0-9]/,"",a[2]); tr=a[2]; next}
-        /tx failed/{split($0,a,":"); gsub(/[^0-9]/,"",a[2]); tf=a[2]; next}
-        END{ if(tr=="") tr=0; if(tf=="") tf=0; printf "%s\t%s", tr, tf }
-    ')
-    tr=$(echo "$stats" | cut -f1)
-    tf=$(echo "$stats" | cut -f2)
-    printf "%s\t%s\t%s\n" "$mac" "$tr" "$tf" >> "$outfile" || true
+    $IW_BIN dev "$ifc" station get "$mac" 2>/dev/null | awk -v mac="$mac" '
+        BEGIN{tr=0;tf=0}
+        /tx retries/{split($0,a,":"); gsub(/[^0-9]/,"",a[2]); tr=a[2]+0}
+        /tx failed/{split($0,a,":"); gsub(/[^0-9]/,"",a[2]); tf=a[2]+0}
+        END{printf "%s\t%s\t%s\n", mac, tr, tf}
+    ' >> "$outfile" || true
 }
 
 start_iw_updater() {
@@ -894,7 +889,7 @@ collect_snapshot() {
         ssid=$(lookup_ssid "$ifc")
         hfile="$BASE_DIR/${ifc}_hostapd.tsv"
         rfile="$BASE_DIR/${ifc}_rates.tsv"
-        log_ts "if=$ifc sta_count=$(wc -l < "$hfile" 2>/dev/null || echo 0)"
+        [ "$TIMERS" = "1" ] && log_ts "if=$ifc sta_count=$(wc -l < "$hfile" 2>/dev/null || echo 0)"
 
         # Skip merge when no stations are present on this iface
         if [ ! -s "$hfile" ]; then
