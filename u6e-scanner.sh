@@ -135,7 +135,7 @@ set -eu
 #   RETRY_WINDOW_SEC=30    rolling window length for txr%
 #   WIN_FORMULA=r2         retry% denominator: r1=tx, r2=tx+failed, r3=tx+failed+retries
 #   WIN_PARTIAL=0          0=blank txr% until full window elapsed; 1=show partial immediately
-#   WIN_MIN_PKTS=10        minimum tx_packets in window required to display txr%-N
+#   WIN_MIN_PKTS=2         minimum tx_packets in window required to display txr%-N
 #   IFACES=auto            "auto" discovers active AP ifaces; or space-separated list
 #   USE_IW=1               1=use iw background loop for retries/failed; 0=skip
 #   IW_GET_ONLY=1          1=per-station iw get only (skip iw dump, unreliable on this fw)
@@ -201,7 +201,7 @@ USE_IW="${USE_IW:-1}"
 IW_GET_ONLY="${IW_GET_ONLY:-1}"
 IW_CACHE_SEC="${IW_CACHE_SEC:-2}"
 WIN_PARTIAL="${WIN_PARTIAL:-0}"
-WIN_MIN_PKTS="${WIN_MIN_PKTS:-10}"
+WIN_MIN_PKTS="${WIN_MIN_PKTS:-2}"
 WIN_FORMULA="${WIN_FORMULA:-r2}"
 DNSNAME_ENABLE="${DNSNAME_ENABLE:-1}"
 DEBUG_INTERVAL="${DEBUG_INTERVAL:-0}"
