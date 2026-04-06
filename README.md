@@ -9,10 +9,9 @@ this tool monitors signal strength, retry rates and upload/download throughput s
 
 * identifies clients using both dns and hostname
 * displays band, ssid, ip, and mac metadata for each client
-* signal strength presented in both dBm and snr relative to floor
-* displays snapshot values for transmit (d_tx), receive (d_r) and transmit retry (d_TxR%) on each refresh
-* rolling windows calculations for average transmit retry (TxR%) and 5th percentile upload/download speeds (UL_p5, DL_p5)
-* highlight host rows for easy identification via `-h` option
+* signal strength presented in both dBm and snr relative to floor, along with negotiated tx and rx rates
+* displays snapshot values for transmit (d_tx), receive (d_r) and transmit retry % for rolling 5s and 30s windows (txr%) on each refresh
+* highlight host rows for easy identification via `-n` option or display select clients with the `-o` option
 * many parameters configurable via env vars (see script comments)
 
 ### notes and caveats
@@ -25,4 +24,4 @@ this tool monitors signal strength, retry rates and upload/download throughput s
 
 ### compability
 
-verified working on U6E firmware 6.8.2.15592 as of March 2026
+verified working on U6E firmware 6.8.2.15592 as of April 2026
