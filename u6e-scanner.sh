@@ -123,6 +123,7 @@ set -eu
 #   -h <name>          bold rows whose hostname exactly matches <name> (repeatable)
 #   -d <name>          bold rows whose dnsname exactly matches <name> (repeatable)
 #   -n <substr>        bold rows where <substr> appears anywhere in hostname or dnsname
+#   -o <substr>        show only rows where <substr> appears in hostname or dnsname (repeatable; implies bold)
 
 # ─── ENV VARS ────────────────────────────────────────────────────────────────
 #
@@ -277,10 +278,11 @@ if [ -f "$MAIN_PID_FILE" ]; then
 fi
 echo $$ > "$MAIN_PID_FILE" 2>/dev/null || true
 
-# Optional flags from CLI: -h/-d/-n for row highlights, -m to show mac column
+# Optional flags from CLI: -h/-d/-n/-o for row highlights/filter, -m to show mac column
 HILITE_HOSTS=""
 HILITE_DNS=""
 HILITE_NAME=""
+ONLY_NAME=""
 SHOW_MAC="0"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -310,6 +312,16 @@ while [ $# -gt 0 ]; do
                 val="$1"
                 if [ -n "$val" ]; then
                     if [ -z "$HILITE_NAME" ]; then HILITE_NAME="$val"; else HILITE_NAME="$HILITE_NAME,$val"; fi
+                fi
+            fi
+            shift || true
+            ;;
+        -o)
+            shift
+            if [ $# -gt 0 ]; then
+                val="$1"
+                if [ -n "$val" ]; then
+                    if [ -z "$ONLY_NAME" ]; then ONLY_NAME="$val"; else ONLY_NAME="$ONLY_NAME,$val"; fi
                 fi
             fi
             shift || true
@@ -989,7 +1001,7 @@ print_report() {
             "band" "ssid" "dnsname" "hostname" "ip" "d_tx" "d_r" "d_txr%" "txr%-${RETRY_WINDOW_SEC}" "sig" "snr" "TxRate" "RxRate"
     fi
     date_hms=$(date +%H:%M:%S)
-    awk -v now_hms="$date_hms" -v hide="$HIDE_IDLE" -v wdir="$WINDOW_DIR" -v prevfn="$STATE_PREV" -v win_secs="$RETRY_WINDOW_SEC" -v dbg="${DEBUG_WIN:-0}" -v dbgfile="$BASE_DIR/win_dbg.txt" -v hilites="$HILITE_HOSTS" -v hilitedns="$HILITE_DNS" -v hilitename="$HILITE_NAME" -v win_partial="$WIN_PARTIAL" -v win_formula="$WIN_FORMULA" -v noisefn="$NOISE_FILE" -v dnsfn="$DNS_MAP_FILE" -v ipfn="$IP_MAP_FILE" -v idebug="${DEBUG_INTERVAL:-0}" -v idbgfile="$BASE_DIR/interval_dbg.txt" -v show_mac="$SHOW_MAC" 'BEGIN{FS="\t"; OFS="\t";
+    awk -v now_hms="$date_hms" -v hide="$HIDE_IDLE" -v wdir="$WINDOW_DIR" -v prevfn="$STATE_PREV" -v win_secs="$RETRY_WINDOW_SEC" -v dbg="${DEBUG_WIN:-0}" -v dbgfile="$BASE_DIR/win_dbg.txt" -v hilites="$HILITE_HOSTS" -v hilitedns="$HILITE_DNS" -v hilitename="$HILITE_NAME" -v onlyname="$ONLY_NAME" -v win_partial="$WIN_PARTIAL" -v win_formula="$WIN_FORMULA" -v noisefn="$NOISE_FILE" -v dnsfn="$DNS_MAP_FILE" -v ipfn="$IP_MAP_FILE" -v idebug="${DEBUG_INTERVAL:-0}" -v idbgfile="$BASE_DIR/interval_dbg.txt" -v show_mac="$SHOW_MAC" 'BEGIN{FS="\t"; OFS="\t";
             # Load auxiliary maps: noise per band, DNS names, IP addresses
             if (noisefn!="") { while ( (getline nl < noisefn) > 0 ) { split(nl, nn, FS); if (nn[1]!="") noise[nn[1]]=nn[2]+0 } close(noisefn) }
             if (dnsfn!="") { while ( (getline dl < dnsfn) > 0 ) { split(dl, dd, FS); if (dd[1]!="") dns[dd[1]]=dd[2] } close(dnsfn) }
@@ -998,6 +1010,7 @@ print_report() {
             nh=split(hilites, hh, ","); for (i=1;i<=nh;i++){ gsub(/^\s+|\s+$/, "", hh[i]); if (hh[i]!="") HL[hh[i]]=1 }
             nd=split(hilitedns, hd, ","); for (i=1;i<=nd;i++){ gsub(/^\s+|\s+$/, "", hd[i]); if (hd[i]!="") HLDNS[hd[i]]=1 }
             nn=split(hilitename, hn, ","); for (i=1;i<=nn;i++){ gsub(/^\s+|\s+$/, "", hn[i]); if (hn[i]!="") HN[i]=hn[i] }; HN_len=nn
+            no=split(onlyname,  on, ","); for (i=1;i<=no;i++){ gsub(/^\s+|\s+$/, "", on[i]); if (on[i]!="") ON[i]=on[i] }; ON_len=no
         }
         (FILENAME==prevfn){ prev[$3]=$0; next }
         {
@@ -1077,10 +1090,17 @@ print_report() {
             if (snr_str!="") { sortkey=snr_val } else { sortkey=$5 }
             # Shift to positive range to preserve numeric sort with negative values
             keynum=10000+sortkey
-            # If a highlight was requested, wrap that row in bold
+            # -n/-h/-d highlight: bold matching rows
             matched=0
             if ($4 in HL || dns_out in HLDNS) matched=1
             if (!matched) { for (i=1;i<=HN_len;i++) { if (HN[i]!="" && (index($4,HN[i])>0 || index(dns_out,HN[i])>0)) { matched=1; break } } }
+            # -o filter: hide rows that don't match; bold those that do
+            if (ON_len>0) {
+                only_matched=0
+                for (i=1;i<=ON_len;i++) { if (ON[i]!="" && (index($4,ON[i])>0 || index(dns_out,ON[i])>0)) { only_matched=1; break } }
+                if (!only_matched) next
+                matched=1
+            }
             if (matched) { pre="\033[1m"; post="\033[0m" } else { pre=""; post="" }
             if (show_mac+0 == 1) {
                 line = sprintf("%s%-7s %-12s %-22s %-20s %-15s %-17s %5d %6d %7.1f%%   %7s %9s %6s  %9s %9s%s",
