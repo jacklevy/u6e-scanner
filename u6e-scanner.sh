@@ -1094,7 +1094,7 @@ print_report() {
             matched=0
             if ($4 in HL || dns_out in HLDNS) matched=1
             if (!matched) { for (i=1;i<=HN_len;i++) { if (HN[i]!="" && (index($4,HN[i])>0 || index(dns_out,HN[i])>0)) { matched=1; break } } }
-            # -o filter: hide rows that don't match; bold those that do
+            # -o filter: hide rows that do not match; bold those that do
             if (ON_len>0) {
                 only_matched=0
                 for (i=1;i<=ON_len;i++) { if (ON[i]!="" && (index($4,ON[i])>0 || index(dns_out,ON[i])>0)) { only_matched=1; break } }
